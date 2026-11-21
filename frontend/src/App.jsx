@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:3001'
+
 function App() {
   const [repoUrl, setRepoUrl] = useState('')
   const [previewData, setPreviewData] = useState(null)
@@ -8,12 +10,13 @@ function App() {
   const [error, setError] = useState('')
   const [errorDetails, setErrorDetails] = useState('')
   const [serverStatus, setServerStatus] = useState('checking')
+  const [stopping, setStopping] = useState(false)
 
   // Check if backend server is running
   useEffect(() => {
     const checkServer = async () => {
       try {
-        const response = await fetch('http://localhost:3001/health')
+        const response = await fetch(API_BASE_URL + '/health')
         if (response.ok) {
           setServerStatus('running')
         } else {
@@ -51,13 +54,21 @@ function App() {
     setLoading(true)
     setError('')
     setErrorDetails('')
+
+    try {
+      if (previewData?.sessionId) {
+        await fetch(API_BASE_URL + '/preview/' + previewData.sessionId, { method: 'DELETE' })
+      }
+    } catch {
+      // The previous session may already have expired or the backend restarted.
+    }
     setPreviewData(null)
 
     try {
       // Validate and format GitHub URL
       const formattedUrl = formatGitHubUrl(repoUrl)
 
-      const response = await fetch('http://localhost:3001/preview', {
+      const response = await fetch(API_BASE_URL + '/preview', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -66,16 +77,19 @@ function App() {
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.error || 'Server error')
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.details || errorData.error || 'Server error')
       }
 
       const data = await response.json()
       
       if (data.success) {
         setPreviewData({
-          imageUrl: `data:image/png;base64,${data.screenshot}`,
+          imageUrl: data.screenshot ? 'data:image/png;base64,' + data.screenshot : null,
           previewUrl: data.previewUrl,
+          sessionId: data.sessionId,
+          expiresAt: data.expiresAt,
+          warning: data.warning,
           message: data.message
         })
       } else {
@@ -93,11 +107,39 @@ function App() {
     }
   }
 
+  const handleStopPreview = async () => {
+    if (!previewData?.sessionId) {
+      setPreviewData(null)
+      return
+    }
+
+    setStopping(true)
+    setError('')
+    setErrorDetails('')
+    try {
+      const response = await fetch(API_BASE_URL + '/preview/' + previewData.sessionId, { method: 'DELETE' })
+      if (!response.ok && response.status !== 404) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.error || 'Could not stop the preview')
+      }
+      setPreviewData(null)
+    } catch (err) {
+      setError('Could not stop the preview')
+      setErrorDetails(err.message || 'Check that the local backend is still running.')
+    } finally {
+      setStopping(false)
+    }
+  }
+
   return (
     <div className="container">
       <h1>GitHub Repository Preview</h1>
       <p className="description">
         Enter a GitHub repository URL to generate a live preview and screenshot.
+      </p>
+
+      <p className="safety-note">
+        Preview only repositories you own or trust. The repository and its dependency scripts run on this computer.
       </p>
       
       {serverStatus === 'error' && (
@@ -124,7 +166,7 @@ function App() {
         </div>
         <button 
           type="submit" 
-          disabled={loading || serverStatus === 'error'} 
+          disabled={loading || serverStatus !== 'running'}
           className="button"
         >
           {loading ? 'Generating Preview...' : 'Generate Preview'}
@@ -149,16 +191,20 @@ function App() {
 
       {previewData && (
         <div className="preview-container">
-          <h2>Preview Generated!</h2>
+          <h2>Preview is live</h2>
           <p className="success-message">{previewData.message}</p>
+          {previewData.expiresAt && (
+            <p className="preview-hint">
+              This preview expires at {new Date(previewData.expiresAt).toLocaleTimeString()}.
+            </p>
+          )}
+          {previewData.warning && <p className="preview-warning">{previewData.warning}</p>}
           
           <div className="preview-section">
             <h3>Screenshot</h3>
-            <img
-              src={previewData.imageUrl}
-              alt="Repository Screenshot"
-              className="screenshot"
-            />
+            {previewData.imageUrl
+              ? <img src={previewData.imageUrl} alt="Repository screenshot" className="screenshot" />
+              : <p className="preview-hint">The live page is available, but no screenshot was returned.</p>}
           </div>
           
           <div className="preview-section">
@@ -178,6 +224,9 @@ function App() {
               Click the link above to open the live preview in a new tab
             </p>
           </div>
+          <button type="button" className="stop-button" onClick={handleStopPreview} disabled={stopping}>
+            {stopping ? 'Stopping Preview...' : 'Stop Preview'}
+          </button>
         </div>
       )}
     </div>

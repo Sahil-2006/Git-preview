@@ -2,331 +2,494 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs-extra');
-const { exec } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const { chromium } = require('playwright');
+const net = require('net');
+const http = require('http');
 const util = require('util');
-const execAsync = util.promisify(exec);
+const execFileAsync = util.promisify(execFile);
 
 const app = express();
-const port = process.env.PORT || 3001;
+const port = Number(process.env.PORT) || 3001;
+const host = process.env.HOST || '127.0.0.1';
+const projectsDir = path.resolve(__dirname, 'temp-projects');
+const previews = new Map();
+const reservedPorts = new Set();
+const MAX_ACTIVE_PREVIEWS = 3;
+const MIN_TTL_MS = 60_000;
+const MAX_TTL_MS = 60 * 60_000;
+const requestedTtl = Number(process.env.PREVIEW_TTL_MS);
+const PREVIEW_TTL_MS = Number.isFinite(requestedTtl)
+  ? Math.max(MIN_TTL_MS, Math.min(requestedTtl, MAX_TTL_MS))
+  : 15 * 60_000;
+const frontendOrigins = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+  ...(process.env.FRONTEND_ORIGIN ? [process.env.FRONTEND_ORIGIN] : [])
+]);
+let previewsStarting = 0;
+let shuttingDown = false;
 
-// Enable CORS with specific options
+app.use((req, res, next) => {
+  const origin = req.get('origin');
+  if (origin && !frontendOrigins.has(origin)) {
+    return res.status(403).json({ error: 'This local service only accepts requests from the configured frontend.' });
+  }
+  next();
+});
+
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
-  methods: ['GET', 'POST'],
-  credentials: true
+  origin: (origin, callback) => callback(null, !origin || frontendOrigins.has(origin)),
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  maxAge: 600
 }));
+app.use(express.json({ limit: '2kb' }));
 
-app.use(express.json());
-
-// Health check endpoint with detailed status
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    port: port,
-    version: process.version
+  res.json({
+    status: shuttingDown ? 'shutting-down' : 'ok',
+    activePreviews: previews.size,
+    startingPreviews: previewsStarting,
+    maxActivePreviews: MAX_ACTIVE_PREVIEWS,
+    previewTtlMs: PREVIEW_TTL_MS
   });
 });
 
-// Create temporary projects directory
-let projectsDir = path.join(__dirname, 'temp-projects');
-
-// Safely clean up directory
-const cleanupDirectory = async (dir) => {
-  try {
-    if (await fs.pathExists(dir)) {
-      await fs.emptyDir(dir);
-    } else {
-      await fs.ensureDir(dir);
-    }
-    return dir;
-  } catch (error) {
-    console.error('Error cleaning up directory:', error);
-    // If directory is locked, create a new one with timestamp
-    const newDir = `${dir}-${Date.now()}`;
-    await fs.ensureDir(newDir);
-    return newDir;
+const canonicalGitHubUrl = (value) => {
+  if (typeof value !== 'string' || value.length > 300) {
+    throw new Error('Enter a public GitHub repository URL.');
   }
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('Enter a valid GitHub repository URL.');
+  }
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'github.com' ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error('Only public repositories on https://github.com are supported.');
+  }
+
+  const match = url.pathname.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\.git)?\/?$/i);
+  if (!match || match[1] === '.' || match[1] === '..') {
+    throw new Error('Use a repository URL in the form https://github.com/owner/repository.');
+  }
+
+  const repository = match[2].replace(/\.git$/i, '');
+  if (!repository || repository === '.' || repository === '..') {
+    throw new Error('Use a repository URL in the form https://github.com/owner/repository.');
+  }
+
+  return 'https://github.com/' + match[1] + '/' + repository + '.git';
 };
 
-// Initialize projects directory
-(async () => {
-  try {
-    projectsDir = await cleanupDirectory(projectsDir);
-    console.log('Projects directory initialized:', projectsDir);
-  } catch (error) {
-    console.error('Failed to initialize projects directory:', error);
-    process.exit(1); // Exit if we can't set up the projects directory
-  }
-})();
-
-// Validate GitHub URL
-const validateGitHubUrl = (url) => {
-  try {
-    const urlObj = new URL(url);
-    if (urlObj.hostname !== 'github.com') {
-      throw new Error('Not a GitHub URL');
-    }
-    const parts = urlObj.pathname.split('/').filter(Boolean);
-    if (parts.length < 2) {
-      throw new Error('Invalid GitHub repository URL format');
-    }
-    return true;
-  } catch (error) {
-    throw new Error('Invalid URL: ' + error.message);
-  }
-};
-
-// Helper to detect project type and get setup commands
 const detectProjectType = async (projectPath) => {
-  const files = await fs.readdir(projectPath);
-  const hasFile = (name) => files.includes(name);
-  
+  const rootEntries = await fs.readdir(projectPath);
+  const hasFile = (name) => rootEntries.includes(name);
+  let packageJson = null;
+
   if (hasFile('package.json')) {
-    const packageJson = await fs.readJson(path.join(projectPath, 'package.json'));
-    const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
-    
-    if (deps['next']) return { type: 'next', startCmd: 'npm run dev', port: 3000 };
-    if (deps['react-scripts']) return { type: 'create-react-app', startCmd: 'npm start', port: 3000 };
-    if (deps['@vue/cli-service']) return { type: 'vue', startCmd: 'npm run serve', port: 8080 };
-    if (deps['vite']) return { type: 'vite', startCmd: 'npm run dev', port: 5173 };
-    
-    // Check for static site with dev dependencies
-    if (hasFile('index.html')) return { type: 'static', startCmd: 'npx serve', port: 3000 };
-    
-    return { type: 'node', startCmd: packageJson.scripts?.start || 'node index.js', port: 3000 };
+    try {
+      packageJson = await fs.readJson(path.join(projectPath, 'package.json'));
+    } catch {
+      throw new Error('The repository has an invalid package.json.');
+    }
   }
-  
-  if (hasFile('index.html')) return { type: 'static', startCmd: 'npx serve', port: 3000 };
-  
-  throw new Error('Unable to detect project type. Repository must contain either package.json or index.html');
+
+  const scripts = packageJson && packageJson.scripts ? packageJson.scripts : {};
+  const dependencies = {
+    ...(packageJson && packageJson.dependencies ? packageJson.dependencies : {}),
+    ...(packageJson && packageJson.devDependencies ? packageJson.devDependencies : {})
+  };
+
+  if (dependencies.next && scripts.dev) return { type: 'next', script: 'dev' };
+  if (dependencies['react-scripts'] && scripts.start) return { type: 'create-react-app', script: 'start' };
+  if (dependencies['@vue/cli-service'] && scripts.serve) return { type: 'vue', script: 'serve' };
+  if (dependencies.vite && scripts.dev) return { type: 'vite', script: 'dev' };
+  if (hasFile('index.html') && !scripts.start) return { type: 'static' };
+  if (scripts.start) return { type: 'node', script: 'start' };
+
+  throw new Error('Unable to detect a supported project. Add a supported framework script or a root index.html.');
 };
 
-// Clone and setup repository
+const runNpm = async (args, options) => {
+  const command = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  return execFileAsync(command, args, {
+    ...options,
+    shell: process.platform === 'win32',
+    windowsHide: true,
+    timeout: options.timeout || 180_000,
+    maxBuffer: 4 * 1024 * 1024
+  });
+};
+
 const setupRepository = async (repoUrl) => {
   const projectId = uuidv4();
   const projectPath = path.join(projectsDir, projectId);
-  
+
   try {
-    console.log('Cloning repository:', repoUrl);
-    await execAsync(`git clone ${repoUrl} ${projectPath}`);
-    console.log('Repository cloned successfully');
-    
-    // Detect project type
-    console.log('Detecting project type...');
+    await fs.ensureDir(projectsDir);
+    await execFileAsync('git', ['clone', '--depth', '1', '--', repoUrl, projectPath], {
+      timeout: 120_000,
+      windowsHide: true,
+      maxBuffer: 2 * 1024 * 1024
+    });
+
     const projectConfig = await detectProjectType(projectPath);
-    console.log('Project type detected:', projectConfig.type);
-    
-    // Install dependencies if needed
     if (projectConfig.type !== 'static') {
-      console.log('Installing dependencies...');
-      try {
-        await execAsync('npm install --force --legacy-peer-deps', { cwd: projectPath });
-        console.log('Dependencies installed successfully');
-      } catch (installError) {
-        console.error('Error installing dependencies:', installError);
-        throw new Error(`Failed to install dependencies: ${installError.message}`);
-      }
+      await runNpm(['install', '--no-audit', '--no-fund', '--legacy-peer-deps'], {
+        cwd: projectPath,
+        timeout: 180_000
+      });
     }
-    
+
     return { projectPath, projectConfig };
   } catch (error) {
-    console.error('Error in setupRepository:', error);
+    await removeOwnedProject(projectPath);
+    if (error.code === 'ETIMEDOUT' || error.killed) {
+      throw new Error('Repository setup timed out. Try a smaller public repository.');
+    }
+    if (error.code === 'ENOENT' && error.syscall === 'spawn git') {
+      throw new Error('Git was not found. Install Git and restart the local preview service.');
+    }
+    if (error.message && error.message.includes('repository not found')) {
+      throw new Error('Repository not found or unavailable. Only public GitHub repositories can be previewed.');
+    }
+    throw new Error('Repository setup failed: ' + (error.message || 'unknown error'));
+  }
+};
+
+const allocatePort = async () => {
+  while (true) {
+    const selectedPort = await new Promise((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const candidate = probe.address().port;
+        probe.close((error) => error ? reject(error) : resolve(candidate));
+      });
+    });
+    if (!reservedPorts.has(selectedPort)) {
+      reservedPorts.add(selectedPort);
+      return selectedPort;
+    }
+  }
+};
+
+const createStaticPreview = async (projectPath, previewPort) => {
+  const staticApp = express();
+  staticApp.use((req, res, next) => {
+    let decodedPath;
     try {
-      await fs.remove(projectPath);
-    } catch (cleanupError) {
-      console.error('Error cleaning up project directory:', cleanupError);
+      decodedPath = decodeURIComponent(req.path);
+    } catch {
+      return res.sendStatus(400);
     }
-    if (error.message.includes('fatal: repository') || error.message.includes('fatal: not a git repository')) {
-      throw new Error('Repository not found or access denied');
+    if (decodedPath.split('/').some((part) => part === '.git' || part === 'node_modules')) {
+      return res.sendStatus(404);
     }
-    throw error;
-  }
-};
-
-// Start development server
-const startDevServer = async (projectPath, startCmd) => {
-  return new Promise((resolve, reject) => {
-    console.log('Starting development server with command:', startCmd);
-    const process = exec(startCmd, { cwd: projectPath });
-    
-    let output = '';
-    let errorOutput = '';
-    
-    // Collect output for debugging
-    process.stdout.on('data', (data) => {
-      output += data;
-      console.log('Server output:', data);
-      if (data.includes('ready') || data.includes('started') || data.includes('running') || data.includes('compiled')) {
-        console.log('Server started successfully');
-        resolve(process);
-      }
-    });
-    
-    process.stderr.on('data', (data) => {
-      errorOutput += data;
-      console.error('Server error:', data);
-      // Only reject if it's a real error, not just warnings
-      if (data.toLowerCase().includes('error') && 
-          !data.toLowerCase().includes('warn') && 
-          !data.toLowerCase().includes('deprecated') &&
-          !data.toLowerCase().includes('peer')) {
-        reject(new Error(`Server error: ${data}`));
-      }
-    });
-    
-    // Timeout after 5 minutes for large projects
-    setTimeout(() => {
-      reject(new Error(`Server start timeout. Output: ${output}\nErrors: ${errorOutput}`));
-    }, 300000);
+    next();
   });
+  staticApp.use(express.static(projectPath, {
+    dotfiles: 'deny',
+    index: ['index.html'],
+    redirect: false,
+    fallthrough: true
+  }));
+  staticApp.get('*', async (req, res, next) => {
+    try {
+      const indexPath = path.join(projectPath, 'index.html');
+      if (await fs.pathExists(indexPath)) return res.sendFile(indexPath);
+      return res.sendStatus(404);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  const server = await new Promise((resolve, reject) => {
+    const listener = staticApp.listen(previewPort, '127.0.0.1', () => resolve(listener));
+    listener.once('error', reject);
+  });
+  return { server, process: null, logs: '' };
 };
 
-app.post('/preview', async (req, res) => {
-  const { repoUrl } = req.body;
-  
-  if (!repoUrl) {
-    return res.status(400).json({ error: 'Repository URL is required' });
+const createNpmPreview = (projectPath, projectConfig, previewPort) => {
+  const args = ['run', projectConfig.script];
+  const env = {
+    ...process.env,
+    HOST: '127.0.0.1',
+    PORT: String(previewPort),
+    BROWSER: 'none',
+    CI: 'true'
+  };
+
+  if (projectConfig.type === 'next') {
+    args.push('--', '--hostname', '127.0.0.1', '--port', String(previewPort));
+  } else if (projectConfig.type === 'vite') {
+    args.push('--', '--host', '127.0.0.1', '--port', String(previewPort), '--strictPort');
+  } else if (projectConfig.type === 'vue') {
+    args.push('--', '--host', '127.0.0.1', '--port', String(previewPort));
   }
 
-  let projectPath;
-  let serverProcess;
+  const command = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const child = spawn(command, args, {
+    cwd: projectPath,
+    env,
+    shell: process.platform === 'win32',
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let logs = '';
+  let startError = null;
+  const collect = (chunk) => {
+    logs = (logs + chunk.toString()).slice(-8000);
+  };
+  child.stdout.on('data', collect);
+  child.stderr.on('data', collect);
+  child.on('error', (error) => {
+    startError = error.message;
+    logs = (logs + '\n' + error.message).slice(-8000);
+  });
+
+  return { process: child, server: null, get logs() { return logs; }, get startError() { return startError; } };
+};
+
+const sleep = (duration) => new Promise((resolve) => setTimeout(resolve, duration));
+
+const probeHttp = (url) => new Promise((resolve) => {
+  const request = http.get(url, (response) => {
+    response.resume();
+    resolve(response.statusCode < 500);
+  });
+  request.setTimeout(2000, () => {
+    request.destroy();
+    resolve(false);
+  });
+  request.on('error', () => resolve(false));
+});
+
+const waitForPreview = async (url, launch, timeoutMs = 90_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const child = launch.process;
+    if (launch.startError) {
+      throw new Error('Could not start the repository server: ' + launch.startError);
+    }
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error('The repository server stopped before becoming ready. ' + launch.logs);
+    }
+    if (await probeHttp(url)) return;
+    await sleep(500);
+  }
+  throw new Error('Preview server did not become ready in time. ' + launch.logs);
+};
+
+const removeOwnedProject = async (projectPath) => {
+  if (!projectPath) return;
+  const resolvedPath = path.resolve(projectPath);
+  const isUuidChild = path.dirname(resolvedPath) === projectsDir &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(path.basename(resolvedPath));
+  if (isUuidChild) await fs.remove(resolvedPath);
+};
+
+const stopProcess = async (child) => {
+  if (!child || child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
+        timeout: 10_000,
+        windowsHide: true
+      });
+      return;
+    } catch {
+      // Fall back to the direct child if taskkill is unavailable.
+    }
+  }
 
   try {
-    // Validate GitHub URL
-    validateGitHubUrl(repoUrl);
-    
-    // Setup repository
+    child.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  await Promise.race([
+    new Promise((resolve) => child.once('exit', resolve)),
+    sleep(4000)
+  ]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // The process may have exited between the check and the signal.
+    }
+  }
+};
+
+const closeServer = async (server) => {
+  if (!server || !server.listening) return;
+  await new Promise((resolve) => server.close(() => resolve()));
+};
+
+const stopPreview = async (previewId) => {
+  const preview = previews.get(previewId);
+  if (!preview) return false;
+
+  previews.delete(previewId);
+  clearTimeout(preview.expiryTimer);
+  try {
+    await stopProcess(preview.process);
+    await closeServer(preview.server);
+    await removeOwnedProject(preview.projectPath);
+  } finally {
+    reservedPorts.delete(preview.port);
+  }
+  return true;
+};
+
+app.get('/preview/:id', (req, res) => {
+  const preview = previews.get(req.params.id);
+  if (!preview) return res.status(404).json({ error: 'Preview not found or expired.' });
+  if (preview.process && (preview.process.exitCode !== null || preview.process.signalCode !== null)) {
+    void stopPreview(req.params.id);
+    return res.status(410).json({ error: 'Preview process has stopped.' });
+  }
+  res.json({
+    status: 'running',
+    previewUrl: preview.previewUrl,
+    expiresAt: preview.expiresAt
+  });
+});
+
+app.delete('/preview/:id', async (req, res) => {
+  const stopped = await stopPreview(req.params.id);
+  if (!stopped) return res.status(404).json({ error: 'Preview not found or already stopped.' });
+  res.json({ success: true, message: 'Preview stopped and its temporary clone removed.' });
+});
+
+app.post('/preview', async (req, res) => {
+  if (shuttingDown) return res.status(503).json({ error: 'The local preview service is shutting down.' });
+  let repoUrl;
+  try {
+    repoUrl = canonicalGitHubUrl(req.body && req.body.repoUrl);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  if (previews.size + previewsStarting >= MAX_ACTIVE_PREVIEWS) {
+    return res.status(429).json({ error: 'All preview slots are in use. Stop a preview and try again.' });
+  }
+
+  previewsStarting += 1;
+  let projectPath;
+  let launch;
+  let previewPort;
+  let browser;
+  let published = false;
+
+  try {
     const setup = await setupRepository(repoUrl);
     projectPath = setup.projectPath;
-    
-    // Start development server
-    serverProcess = await startDevServer(setup.projectPath, setup.projectConfig.startCmd);
-    
-    // Wait a bit longer for the server to be fully ready
-    await new Promise(resolve => setTimeout(resolve, 10000));
-    
-    // Generate preview URL
-    const previewUrl = `http://localhost:${setup.projectConfig.port}`;
-    
-    // Take screenshot using Playwright
-    console.log('Taking screenshot...');
-    const browser = await chromium.launch();
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 1280, height: 720 });
-    
+    previewPort = await allocatePort();
+
+    launch = setup.projectConfig.type === 'static'
+      ? await createStaticPreview(projectPath, previewPort)
+      : createNpmPreview(projectPath, setup.projectConfig, previewPort);
+
+    const previewUrl = 'http://127.0.0.1:' + previewPort;
+    await waitForPreview(previewUrl, launch);
+
+    let screenshot = null;
+    let warning = null;
     try {
-      await page.goto(previewUrl, { 
-        waitUntil: 'networkidle',
-        timeout: 60000 
-      });
-      
-      // Wait for any animations to complete
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      const screenshot = await page.screenshot({ fullPage: true });
-      await browser.close();
-      
-      // Clean up
-      if (serverProcess) {
-        try {
-          serverProcess.kill();
-        } catch (error) {
-          console.error('Error killing server process:', error);
-        }
-      }
-      
-      if (projectPath) {
-        try {
-          await fs.remove(projectPath);
-        } catch (error) {
-          console.error('Error removing project directory:', error);
-        }
-      }
-      
-      res.json({
-        success: true,
-        previewUrl,
-        screenshot: screenshot.toString('base64'),
-        message: 'Preview generated successfully'
-      });
-    } catch (screenshotError) {
-      console.error('Error taking screenshot:', screenshotError);
-      throw new Error(`Failed to take screenshot: ${screenshotError.message}`);
-    }
-  } catch (error) {
-    console.error('Error:', error);
-    
-    // Clean up on error
-    if (serverProcess) {
-      try {
-        serverProcess.kill();
-      } catch (error) {
-        console.error('Error killing server process:', error);
+      browser = await chromium.launch();
+      const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+      await page.goto(previewUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await sleep(750);
+      screenshot = (await page.screenshot({ fullPage: false })).toString('base64');
+    } catch (error) {
+      warning = 'The live preview is running, but a screenshot could not be created: ' + error.message;
+    } finally {
+      if (browser) {
+        await browser.close().catch(() => {});
+        browser = null;
       }
     }
-    
-    if (projectPath) {
-      try {
-        await fs.remove(projectPath);
-      } catch (error) {
-        console.error('Error removing project directory:', error);
-      }
-    }
-    
-    res.status(500).json({ 
-      error: 'Failed to generate preview',
-      details: error.message 
+
+    const previewId = uuidv4();
+    const expiresAt = new Date(Date.now() + PREVIEW_TTL_MS).toISOString();
+    const session = {
+      projectPath,
+      port: previewPort,
+      process: launch.process,
+      server: launch.server,
+      previewUrl,
+      expiresAt,
+      expiryTimer: null
+    };
+    session.expiryTimer = setTimeout(() => {
+      void stopPreview(previewId).catch((error) => console.error('Preview cleanup failed:', error.message));
+    }, PREVIEW_TTL_MS);
+    if (session.expiryTimer.unref) session.expiryTimer.unref();
+
+    previews.set(previewId, session);
+    published = true;
+    res.json({
+      success: true,
+      sessionId: previewId,
+      previewUrl,
+      expiresAt,
+      screenshot,
+      warning,
+      message: 'Preview is live until it is stopped or expires.'
     });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    if (launch) {
+      await stopProcess(launch.process);
+      await closeServer(launch.server);
+    }
+    await removeOwnedProject(projectPath);
+    if (previewPort !== undefined) reservedPorts.delete(previewPort);
+    console.error('Preview generation failed:', error.message);
+    res.status(500).json({
+      error: 'Failed to generate preview.',
+      details: error.message
+    });
+  } finally {
+    previewsStarting -= 1;
+    if (!published && previewPort !== undefined) reservedPorts.delete(previewPort);
   }
 });
 
-// Start the server with error handling and retry logic
-const startServer = (retries = 5) => {
-  const server = app.listen(port, '0.0.0.0', (error) => {
-    if (error) {
-      console.error('Error starting server:', error);
-      if (retries > 0 && error.code === 'EADDRINUSE') {
-        console.log(`Port ${port} in use, retrying in 1 second... (${retries} retries left)`);
-        setTimeout(() => startServer(retries - 1), 1000);
-      } else {
-        process.exit(1);
-      }
-      return;
-    }
-    console.log(`Server running on http://localhost:${port}`);
-  });
+const server = app.listen(port, host, () => {
+  console.log('Local preview API listening at http://' + host + ':' + port);
+});
 
-  // Handle server errors
-  server.on('error', (error) => {
-    console.error('Server error:', error);
-    if (error.code === 'EADDRINUSE') {
-      console.error(`Port ${port} is already in use. Retrying...`);
-      setTimeout(() => {
-        server.close();
-        startServer(retries - 1);
-      }, 1000);
-    } else {
-      process.exit(1);
-    }
-  });
+server.on('error', (error) => {
+  console.error('Unable to start the local preview API:', error.message);
+  process.exitCode = 1;
+});
 
-  // Handle graceful shutdown
-  const shutdown = () => {
-    console.log('\nShutting down gracefully...');
-    server.close(() => {
-      console.log('Server closed');
-      process.exit(0);
-    });
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-
-  return server;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  server.close();
+  await Promise.all([...previews.keys()].map((previewId) => stopPreview(previewId)));
 };
 
-// Start the server
-startServer();
+process.on('SIGINT', () => { void shutdown(); });
+process.on('SIGTERM', () => { void shutdown(); });
